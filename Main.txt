@@ -1,3 +1,82 @@
+dummy data ---> metrics.csv,slo_target.yml,topology.json
+metrics.csv
+timestamp,service,latency_ms,error_rate,throughput_rps
+2025-03-01T12:00:00z,inventory,115.57,0.0238,904
+2025-03-01T12:01:00z,auth,358.32,0.0085,307
+2025-03-01T12:02:00z,search,400.93,0.0001,462
+2025-03-01T12:03:00z,auth,282.57,0.0287,202
+2025-03-01T12:04:00z,payments,451.37,0.00221,858
+2025-03-01T12:05:00z,auth,300.06,0.0464,786
+2025-03-01T12:06:00z,auth,51.58,0.0315,470
+2025-03-01T12:07:00z,inventory,437.66,0.0043,594
+2025-03-01T12:08:00z,payments,81.07,0.0495,686
+2025-03-01T12:09:00z,search,245.34,0.0025,799
+2025-03-01T12:10:00z,search,381.1,0.0088,917
+2025-03-01T12:11:00z,search,166.01,0.0107,213
+2025-03-01T12:12:00z,auth,62.88,0.0125,323
+2025-03-01T12:13:00z,inventory,178.15,0.0413,115
+2025-03-01T12:14:00z,payments,79.49,0.0027,990
+2025-03-01T12:15:00z,search,431.37,0.0164,489
+2025-03-01T12:16:00z,search,125.01,0.0417,767
+2025-03-01T12:17:00z,inventory,51.42,0.0197,968
+2025-03-01T12:18:00z,inventory,491.84,0.02,676
+2025-03-01T12:10:00z,inventory,141.96,0.0033,903
+
+slo_target.yml
+auth:
+  error_rate: 0.01
+  latency_ms: 200
+inventory:
+  error_rate: 0.015
+  latency_ms: 250
+payments:
+  error_rate: 0.02
+  latency_ms: 300
+search:
+  error_rate: 0.005
+  latency_ms: 150
+
+topology.json
+{
+    "nodes": [
+        {
+            "id":  "auth",
+            "type": "service"
+        },
+        {
+            "id": "payments",
+            "type": "service"
+        },
+        {
+            "id": "inventory",
+            "type": "service"
+        },
+        {
+            "id": "search",
+            "type":"service"
+        }
+    ],
+    "edges": [
+        {
+            "src": "auth",
+            "dst": "payments"
+        },
+        {
+            "src": "payments",
+            "dst": "inventory"
+        },
+        {
+            "src": "inventory",
+            "dst": "search"
+        }
+    ]
+}
+
+-------------------------------------
+
+
+
+-------------------------------------------
 src/models.py
 -------------------------------
 
