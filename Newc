@@ -1,0 +1,90 @@
+from pydantic import BaseModel
+from typing import List, Dict
+
+# Matches slo_target.yml format
+class SLOTarget(BaseModel):
+    service: str
+    metric: str
+    threshold: float
+    window_minutes: int = 60
+    forecast_horizon_minutes: int = 60
+
+class SLOTargetsFile(BaseModel):
+    slo_targets: List[SLOTarget]
+
+# Matches topology.json format
+class Topology(BaseModel):
+    nodes: List[dict]
+    edges: List[dict]
+
+
+
+
+
+
+def load_yaml(path: str):
+    with open(path, 'r') as fh:
+        return yaml.safe_load(fh)
+
+def load_slo_targets(path: str):
+    raw = load_yaml(path)
+
+    slo_list = []
+    for service, metrics in raw.items():
+        for metric, threshold in metrics.items():
+            slo_list.append({
+                "service": service,
+                "metric": metric,
+                "threshold": threshold
+            })
+    return {"slo_targets": slo_list}
+
+def load_metrics(paths_pattern: str):
+    chunks = []
+    for f in glob.glob(paths_pattern):
+        df = pd.read_csv(f, parse_dates=['timestamp'])
+        chunks.append(df)
+
+    if not chunks:
+        return pd.DataFrame()
+
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.sort_values("timestamp")
+    df = df.set_index("timestamp")
+    return df
+
+
+
+
+
+167,8
+from utils import load_slo_targets
+
+slo_data = load_slo_targets(os.path.join(data_dir, "slo_target.yml"))
+slo_config = SLOTargetsFile(**slo_data)
+
+186
+# series is directly the metric column for the service
+if metric not in metrics.columns:
+    print(f"Metric {metric} not found in metrics.csv")
+    continue
+
+series = metrics[metrics['service'] == slo.service][metric]
+series = series.resample("1T").mean()
+
+
+180
+for slo in slo_config.slo_targets:
+    metric = slo.metric
+    service = slo.service
+    threshold = slo.threshold
+
+    if metric not in metrics.columns:
+        print("Missing metric", metric)
+        continue
+
+    series = metrics[metrics['service'] == service][metric].resample("1T").mean()
+
+    if series.empty:
+        print(f"No data for {service} - {metric}")
+        continue
