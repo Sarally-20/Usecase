@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+import matplotlib.pyplot as plt
+
+# Stats for drift and forecasting
+from scipy.stats import ks_2samp
+from statsmodels.tsa.arima.model import ARIMA
+
+# LLM loading
+try:
+    # Try preferred adapter
+    from langchain_ollama import OllamaLLM
+    def make_llm(model_name):
+        return OllamaLLM(model=model_name)
+except Exception:
+    try:
+        from langchain.llms import Ollama
+        def make_llm(model_name):
+            return Ollama(model=model_name)
+    except Exception:
+        OllamaLLM = None
+        def make_llm(model_name):
+            raise RuntimeError("Install langchain_ollama or langchain-ollama")
+
+# Local imports
+from utils import load_metrics, load_yaml
+
+# -------------------------
+# Drift helper functions
+# -------------------------
+def compute_recent_and_baseline(series: pd.Series, window_minutes: int):
+    now = series.index.max()
+    recent_start = now - pd.Timedelta(minutes=window_minutes)
+    baseline_end = recent_start - pd.Timedelta(seconds=1)
+    baseline_start = baseline_end - pd.Timedelta(minutes=window_minutes)
+
+    recent = series[recent_start:now]
+    baseline = series[baseline_start:baseline_end]
+
+    return recent, baseline
+
+
+def detect_drift(baseline: pd.Series, recent: pd.Series):
+    if len(baseline) < 5 or len(recent) < 5:
+        return {"drift": False, "pvalue": 1.0}
+
+    stat, pvalue = ks_2samp(baseline.dropna(), recent.dropna())
+    return {"drift": pvalue < 0.05, "pvalue": float(pvalue), "stat": float(stat)}
+
+
+def forecast_series(series: pd.Series, horizon_minutes: int, freq_minutes=1):
+    series = series.asfreq(f"{freq_minutes}T").fillna(method="ffill").fillna(method="bfill")
+    vals = series.values
+
+    if len(vals) < 10:
+        return series.index, series.values  # Not enough data
+
+    try:
+        model = ARIMA(vals, order=(2, 1, 0))
+        res = model.fit()
+        steps = int(horizon_minutes / freq_minutes)
+        pred = res.forecast(steps=steps)
+        idx = pd.date_range(start=series.index.max() + pd.Timedelta(minutes=freq_minutes),
+                            periods=steps, freq=f"{freq_minutes}T")
+        return idx, np.array(pred)
+    except:
+        # fallback: linear trend
+        slope = (vals[-1] - vals[0]) / max(len(vals) - 1, 1)
+        steps = int(horizon_minutes / freq_minutes)
+        idx = pd.date_range(start=series.index.max() + pd.Timedelta(minutes=freq_minutes),
+                            periods=steps, freq=f"{freq_minutes}T")
+        pred = vals[-1] + slope * np.arange(1, steps + 1)
+        return idx, pred
+
+
+def compute_risk_score(current_value, threshold, drift_pvalue, forecast_vals):
+    # closeness normalized (0..1)
+    closeness = max(0.0, min(1.0, current_value / max(threshold, 1.0)))
+
+    # Forecast probability of exceeding threshold
+    fbreach = float((forecast_vals > threshold).mean())
+
+    drift_factor = 1.0 if drift_pvalue < 0.05 else 0.0
+
+    # final score
+    score = (0.6 * closeness + 0.25 * fbreach + 0.15 * drift_factor) * 100
+    return float(score)
+
+# -------------------------
+# LLM mitigation generation
+# -------------------------
+
+LLM_TOOL_WHITELIST = ["explain", "suggest_mitigation", "no_action"]
+
+LLM_PROMPT_TEMPLATE = """
+You are SLOWA: an on-call advisor that ONLY provides guidance. You do NOT take remote actions.
+
+Allowed tool keywords: {tools}
+
+SLO Context:
+- slo_id: {slo_id}
+- service: {service}
+- metric: {metric}
+- threshold: {threshold}
+- current_value: {current_value}
+- recent_mean: {recent_mean}
+- drift_pvalue: {drift_pvalue}
+- forecast_summary: {forecast_summary}
+- topology_summary: {topology_summary}
+
+Provide:
+1) A clear risk summary (2–4 sentences)
+2) A prioritized mitigation plan (bullet points)
+3) Monitoring / dashboard checks (PromQL or pseudo queries)
+4) A reminder that actions require human approval
+"""
+
+def generate_mitigation(llm, ctx: dict):
+    prompt = LLM_PROMPT_TEMPLATE.format(
+        tools=", ".join(LLM_TOOL_WHITELIST),
+        **ctx
+    )
+
+    result = llm.invoke([
+        {"role": "system", "content": "You are SLOWA, follow all rules."},
+        {"role": "user", "content": prompt}
+    ])
+    
+    return str(result)
+
+# -------------------------
+# Main
+# -------------------------
+def run(data_dir: str, out_dir: str, model_name="llama2:7b"):
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Load metrics
+    metrics = load_metrics(os.path.join(data_dir, "metrics*.csv"))
+    if metrics.empty:
+        print("No metrics found")
+        return
+
+    metrics['timestamp'] = pd.to_datetime(metrics['timestamp'])
+    metrics = metrics.set_index('timestamp').sort_index()
+
+    # Load simple SLO file (Option A)
+    slo_yaml = load_yaml(os.path.join(data_dir, "slo_targets.yml"))
+    topology = load_yaml(os.path.join(data_dir, "topology.json"))
+
+    # Initialize LLM
+    try:
+        llm = make_llm(model_name)
+    except Exception as e:
+        print("LLM error:", e)
+        llm = None
+
+    results = []
+
+    # For each service in SLO YAML
+    for service, cfg in slo_yaml.items():
+        # cfg = { 'latency_ms': 200, 'error_rate':0.01 ... }
+
+        for metric, threshold in cfg.items():
+
+            if metric not in metrics.columns:
+                print(f"Metric {metric} missing for service {service}")
+                continue
+
+            # Filter by service
+            svc_df = metrics[metrics["service"] == service]
+            if svc_df.empty:
+                print(f"No data for service {service}")
+                continue
+
+            series = svc_df[metric].resample("1T").mean()
+
+            if series.empty:
+                print(f"No metric data for {service} - {metric}")
+                continue
+
+            # Sliding windows
+            window = 60     # 1 hour
+            horizon = 60    # forecast 1 hour ahead
+
+            recent, baseline = compute_recent_and_baseline(series, window)
+            drift = detect_drift(baseline, recent)
+            idx, forecast_vals = forecast_series(series, horizon)
+
+            current_value = float(series.iloc[-1])
+            recent_mean = float(recent.mean()) if not recent.empty else current_value
+
+            forecast_summary = {
+                "mean": float(np.mean(forecast_vals)),
+                "max": float(np.max(forecast_vals)),
+                "min": float(np.min(forecast_vals))
+            }
+
+            risk_score = compute_risk_score(
+                current_value=current_value,
+                threshold=threshold,
+                drift_pvalue=drift["pvalue"],
+                forecast_vals=forecast_vals
+            )
+
+            # Plot and save
+            fig, ax = plt.subplots(figsize=(8, 3))
+            series[-120:].plot(ax=ax, label="history")
+            pd.Series(forecast_vals, index=idx).plot(ax=ax, label="forecast", linestyle="--")
+            ax.axhline(threshold, linestyle=":", color="k", label="threshold")
+            ax.set_title(f"{service}:{metric} Risk {risk_score:.1f}")
+            ax.legend()
+
+            chart_path = os.path.join(out_dir, f"{service}_{metric}.png")
+            fig.savefig(chart_path, bbox_inches="tight")
+            plt.close(fig)
+
+            # LLM Context
+            ctx = {
+                "slo_id": f"{service}-{metric}",
+                "service": service,
+                "metric": metric,
+                "threshold": threshold,
+                "current_value": current_value,
+                "recent_mean": recent_mean,
+                "drift_pvalue": drift["pvalue"],
+                "forecast_summary": forecast_summary,
+                "topology_summary": topology
+            }
+
+            mitigation = None
+            if llm:
+                try:
+                    mitigation = generate_mitigation(llm, ctx)
+                except Exception as e:
+                    mitigation = f"LLM error: {e}"
+
+            results.append({
+                "slo_id": f"{service}-{metric}",
+                "service": service,
+                "metric": metric,
+                "risk_score": risk_score,
+                "drift": drift,
+                "forecast": forecast_summary,
+                "chart": chart_path,
+                "mitigation": mitigation
+            })
+
+    # Save reports
+    with open(os.path.join(out_dir, "risk_report.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    with open(os.path.join(out_dir, "mitigations.txt"), "w") as f:
+        for r in results:
+            f.write(f"=== {r['slo_id']} ===\n")
+            f.write((r['mitigation'] or "No mitigation") + "\n\n")
+
+    print("DOE. Output in", out_dir)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--out-dir", default="out")
+    parser.add_argument("--model", default="llama2:7b")
+    args = parser.parse_args()
+    run(args.data_dir, args.out_dir, args.model)
